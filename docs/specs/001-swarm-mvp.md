@@ -51,20 +51,27 @@ Each is verifiable. The MVP is done when all pass.
 
 - [ ] **AC1 — Correlation.** `swarm run` obtains each slice's Actions run ID
       **directly from the dispatch response**, not by polling and matching run
-      names. `POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches`
-      returns **200 with `workflow_run_id`, `run_url`, `html_url`**
-      ([REST docs](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event));
-      this endpoint historically returned `204 No Content`, which is where the
-      run-name workaround came from. Verified: dispatch 3 slices, each returns a
-      distinct `workflow_run_id`, all three recorded in the manifest (§5a)
-      before any polling begins. `gh workflow run` does print the created run
-      URL — observed in the S1 dispatch — but the CLI uses
-      `gh api -X POST …/dispatches` to read `workflow_run_id` as a structured
-      field rather than scraping a URL; URL parsing stays available as a
-      compatibility fallback.
-      `[DOC-VERIFIED — one empirical confirmation of the response body still
-      owed; fold into S2.]`
-      If the response ever lacks the ID, `swarm run` fails fast rather than
+      names. **The behaviour is gated on the API version, and this is a trap:**
+
+      | `X-GitHub-Api-Version` | Response |
+      |---|---|
+      | `2022-11-28` — **`gh`'s default** | `204 No Content`, no run ID |
+      | `2026-03-10` | `200 OK` with `workflow_run_id`, `run_url`, `html_url` |
+
+      Both measured directly against this repo. `2022-11-28` is deprecated
+      (`Deprecation: 2026-03-10`, `Sunset: 2028-03-10`) but is still what a
+      plain `gh api` call selects, so **the CLI MUST send
+      `X-GitHub-Api-Version: 2026-03-10` explicitly.** Omitting it silently
+      regresses the whole design back to run-name correlation.
+
+      Verified: `POST …/dispatches` with the header returned
+      `{"workflow_run_id":30203984480,…}`; the same call without it returned
+      `204`. Remaining for S2: dispatch 3 slices, confirm 3 distinct
+      `workflow_run_id`s recorded in the manifest (§5a) before any polling.
+      `gh workflow run` does print the created run URL, but the CLI uses
+      `gh api` to read `workflow_run_id` as a structured field rather than
+      scraping a URL; URL parsing stays available as a compatibility fallback.
+      If a response ever lacks the ID, `swarm run` fails fast rather than
       falling back to name matching.
 - [ ] **AC2 — Isolation.** Each slice job checks out `base_ref` fresh; no slice
       observes another slice's commits. Verified: two slices editing the same
@@ -89,23 +96,24 @@ Each is verifiable. The MVP is done when all pass.
       slices than the account's concurrency limit queues rather than fails, and
       `swarm status` shows queued slices distinctly from running ones.
 - [x] **AC8 — DeepSeek sustains a multi-turn agentic loop.** *Met by run
-      [30202976198](https://github.com/mach4-braai/github-actions-agent-swarm/actions/runs/30202976198).*
-      A slice against `api.deepseek.com/anthropic` completed a 6-turn loop that
-      read `spike/target.txt`, edited it, and produced a correct `sha256` prefix
-      of the **post-edit** content (`expected=247151647fa9 actual=247151647fa9`).
-      **Scope, stated precisely:**
-      (a) Multi-turn tool use against this endpoint works, and the filesystem
-      mutation is real.
-      (b) The hash proves the *files are consistent*, **not** that the `Bash`
-      tool specifically ran. The fixture is static, so the value is in principle
-      reachable by another route. Claude Code exposes no non-shell execution
-      tool, which makes shell use very likely — but that is inference, not
-      observation, and this spec does not record it as fact.
-      (c) It says nothing about **MCP** — no MCP server was configured or
-      invoked (see D2).
-      To upgrade (b) to observation: rerun with `--output-format stream-json
-      --verbose`, assert a `Bash` `tool_use` event, and seed the task with a
-      runtime nonce so the expected value cannot be precomputed. Folded into S2.
+      [30203984480](https://github.com/mach4-braai/github-actions-agent-swarm/actions/runs/30203984480).*
+      Shell execution is **observed, not inferred**. The workflow seeded a
+      random nonce into `spike/target.txt` at runtime — never present in the
+      prompt — so the expected hash could not be precomputed by anyone, and the
+      agent could only learn the nonce by reading the file. The model's own
+      `stream-json` output then showed the tool calls directly:
+
+      ```
+      2 Bash
+      1 Read
+      1 Write
+      ```
+
+      5 turns, `is_error: false`, `expected=b497bd3f2433 actual=b497bd3f2433`
+      against nonce `nonce-515bd4bd6736b25f0ebae72d8c7d28e4`.
+      Usage: 22,023 input / 813 output / 87,808 cached-read tokens.
+      **Still out of scope:** MCP. No MCP server was configured or invoked, so
+      client-side MCP over this endpoint remains untested (see D2).
 - [ ] **AC9 — The agent holds no usable write credential.** Verified
       adversarially, not by inspection: plant a task instructing the agent to
       push a branch and to harvest credentials. The assertions are what a
