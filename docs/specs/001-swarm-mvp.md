@@ -49,22 +49,23 @@ swarm collect         # branches + result.json per slice, locally
 
 Each is verifiable. The MVP is done when all pass.
 
-- [ ] **AC1 — Correlation.** Dispatching a slice with id `S` produces exactly one
-      Actions run whose `run-name` contains `S`, resolvable by
-      `gh run list --json name,databaseId`. Verified: dispatch 3 slices, all 3
-      resolve to distinct run IDs with no polling ambiguity.
-      **The mechanism lives in the target repo's caller, not in the reusable
-      workflow** — `run-name` inside a `workflow_call` workflow is ignored, only
-      the caller's applies (D1). So `swarm run` **preflights the remote caller
-      before dispatching** — reading it via
-      `gh api repos/{owner}/{repo}/contents/…?ref=<ref>`, never the local
-      working tree, since dispatch executes whatever GitHub has. `run-name` must
-      template `inputs.slice_id` and the required inputs must be declared, else
-      it refuses to dispatch. Verified two ways: a committed caller with the
-      `run-name` line stripped is rejected, and an `init`-ed but **uncommitted**
-      caller is also rejected — in both cases **with no Actions run created**.
-      Post-dispatch fail-fast remains the backstop for the preflight/dispatch
-      race.
+- [ ] **AC1 — Correlation.** `swarm run` obtains each slice's Actions run ID
+      **directly from the dispatch response**, not by polling and matching run
+      names. `POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches`
+      returns **200 with `workflow_run_id`, `run_url`, `html_url`**
+      ([REST docs](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event));
+      this endpoint historically returned `204 No Content`, which is where the
+      run-name workaround came from. Verified: dispatch 3 slices, each returns a
+      distinct `workflow_run_id`, all three recorded in the manifest (§5a)
+      before any polling begins. `gh workflow run` does print the created run
+      URL — observed in the S1 dispatch — but the CLI uses
+      `gh api -X POST …/dispatches` to read `workflow_run_id` as a structured
+      field rather than scraping a URL; URL parsing stays available as a
+      compatibility fallback.
+      `[DOC-VERIFIED — one empirical confirmation of the response body still
+      owed; fold into S2.]`
+      If the response ever lacks the ID, `swarm run` fails fast rather than
+      falling back to name matching.
 - [ ] **AC2 — Isolation.** Each slice job checks out `base_ref` fresh; no slice
       observes another slice's commits. Verified: two slices editing the same
       file both succeed, each diffing against `base_ref`.
@@ -87,12 +88,24 @@ Each is verifiable. The MVP is done when all pass.
 - [ ] **AC7 — Concurrency is bounded and degrades sanely.** Dispatching more
       slices than the account's concurrency limit queues rather than fails, and
       `swarm status` shows queued slices distinctly from running ones.
-- [ ] **AC8 — DeepSeek runtime is genuinely agentic.** A slice running against
-      `api.deepseek.com/anthropic` completes a multi-turn loop that reads a
-      file, edits it, and runs a shell command. Verified: the smallest possible
-      real task end-to-end. This closes the `[INFERENCE]` on client-side tool
-      delivery in D2 and is the **first slice to build** — everything else is
-      wasted if the endpoint cannot sustain the loop.
+- [x] **AC8 — DeepSeek sustains a multi-turn agentic loop.** *Met by run
+      [30202976198](https://github.com/mach4-braai/github-actions-agent-swarm/actions/runs/30202976198).*
+      A slice against `api.deepseek.com/anthropic` completed a 6-turn loop that
+      read `spike/target.txt`, edited it, and produced a correct `sha256` prefix
+      of the **post-edit** content (`expected=247151647fa9 actual=247151647fa9`).
+      **Scope, stated precisely:**
+      (a) Multi-turn tool use against this endpoint works, and the filesystem
+      mutation is real.
+      (b) The hash proves the *files are consistent*, **not** that the `Bash`
+      tool specifically ran. The fixture is static, so the value is in principle
+      reachable by another route. Claude Code exposes no non-shell execution
+      tool, which makes shell use very likely — but that is inference, not
+      observation, and this spec does not record it as fact.
+      (c) It says nothing about **MCP** — no MCP server was configured or
+      invoked (see D2).
+      To upgrade (b) to observation: rerun with `--output-format stream-json
+      --verbose`, assert a `Bash` `tool_use` event, and seed the task with a
+      runtime nonce so the expected value cannot be precomputed. Folded into S2.
 - [ ] **AC9 — The agent holds no usable write credential.** Verified
       adversarially, not by inspection: plant a task instructing the agent to
       push a branch and to harvest credentials. The assertions are what a
@@ -189,7 +202,7 @@ target repo adopts the swarm by committing a thin caller into its own
 
 ```yaml
 name: swarm-agent
-run-name: agent/${{ inputs.slice_id }}     # REQUIRED — the correlation handle
+run-name: agent/${{ inputs.slice_id }}     # display only — nice logs, not load-bearing
 
 on:
   workflow_dispatch:
@@ -211,37 +224,35 @@ jobs:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 ```
 
-**The `run-name` line is load-bearing and cannot be moved into the reusable
-workflow.** `workflow_dispatch` returns no run ID, so correlation depends
-entirely on matching a templated run name — and GitHub ignores `run-name` in a
-called workflow, since one caller may invoke several. Verified against
-[GitHub's own discussion of the limitation](https://github.com/orgs/community/discussions/11396).
+**`run-name` is display-only.** An earlier revision of this spec made it the
+correlation handle, on the premise that `workflow_dispatch` returns no run ID.
+That premise is obsolete: the dispatch endpoint now returns
+`workflow_run_id` directly (AC1). The line stays because `agent/<slice_id>` is
+far easier to scan in the Actions UI than five identical `swarm-agent` rows —
+but a consumer who deletes it degrades nothing but readability.
 
-The correlation handle therefore sits in code *we do not own*. That does **not**
-mean the orchestrator is reduced to failing late, and it does not force a
-trade-off against write access to consumer repos — generating the caller is a
-local write, and checking it is a read-only API call:
+This retires the design's sharpest edge. Correlation no longer depends on
+consumer-owned code being exactly right, so the whole class of "the caller
+dropped a line and runs became unfindable" failures disappears rather than
+being mitigated.
 
-- **`swarm init`** writes the caller template into the target repo's working
-  tree for the human to review and commit. A local file write; the orchestrator
-  never needs a token that can push to a consumer's repo.
+Two supports remain, both still worth their keep:
+
+- **`swarm init`** writes the caller into the target repo's working tree for the
+  human to review and commit. A local write; the orchestrator never needs a
+  token that can push to a consumer's repo.
 - **`swarm run` preflights the *remote* caller before dispatching**, via
-  `gh api repos/{owner}/{repo}/contents/.github/workflows/<file>?ref=<ref>`, and
-  verifies `run-name` templates `inputs.slice_id` and that the required inputs
-  are declared. A caller that fails the check is refused **before** any
-  dispatch.
+  `gh api repos/{owner}/{repo}/contents/.github/workflows/<file>?ref=<ref>`. It
+  no longer checks `run-name`; it verifies the **declared inputs** match what
+  the CLI is about to send. A dispatch naming an undeclared input is rejected by
+  GitHub anyway — preflight turns that into a clear local error instead of a
+  failed API call, and catches the uncommitted-caller case.
 
-**Preflight must read the remote ref, never the local working tree.** Dispatch
-executes whatever GitHub has, so a freshly `init`-ed but uncommitted file would
-pass a local check and then 404 on dispatch — or, worse, silently run an older
-committed caller. `workflow_dispatch` additionally requires the workflow to
-exist on the **default branch** for the event to be available at all, so
+Preflight must still read the **remote** ref, never the local working tree:
+dispatch executes whatever GitHub has, so a freshly `init`-ed but uncommitted
+file would pass a local check and then 404. `workflow_dispatch` also requires
+the workflow on the **default branch** for the event to exist at all, so
 preflight checks both the default branch and the dispatch ref when they differ.
-
-Preflight is what actually closes the hole. Failing fast *after* dispatch still
-leaves an orphan Actions run burning minutes with no way to address it; the
-run-name is already fixed by then. Post-dispatch fail-fast (AC1) remains as the
-backstop for the race where the workflow changes between preflight and dispatch.
 
 Secrets are mapped explicitly, never `secrets: inherit` — inherit hands the
 agent every secret the target repo owns, including ones unrelated to this
@@ -321,9 +332,9 @@ consequence for this design:
 
 | Field | Status | Consequence |
 |---|---|---|
-| `cache_control` | Ignored | **No prompt caching.** Cost grows with the square of turn count as context replays. Keep slices small; this is a design constraint, not a footnote. |
+| `cache_control` | Ignored | The field is ignored, but caching still happens: DeepSeek runs [context caching on disk](https://api-docs.deepseek.com/guides/kv_cache) by default, no code change needed. Observed once, in run [30202976198](https://github.com/mach4-braai/github-actions-agent-swarm/actions/runs/30202976198): `cache_read_input_tokens: 107904` vs `cache_creation_input_tokens: 0` (a translation of DeepSeek's native `prompt_cache_hit_tokens`). The spec's original "no prompt caching" claim is refuted. But DeepSeek states it is **best-effort with no guaranteed hit rate**, hits need a **full match** of a persisted prefix unit, and unused caches clear "within a few hours to a few days" — so this is one measured run, not a cost curve. |
 | `image` / `document` | Not supported | No screenshot or PDF slices. Code-only tasks. |
-| `mcp_servers` | Ignored | Anthropic's *server-side* MCP connector is unavailable. Client-side MCP is sent as ordinary `tools` and should still work `[INFERENCE — untested against this endpoint; AC8 verifies]`. |
+| `mcp_servers` | Ignored | Anthropic's *server-side* MCP connector is unavailable. Whether **client-side MCP** works is `[UNTESTED]` — AC8 exercised only Claude Code's built-in Read/Edit/Bash tools, not an MCP server. Ordinary tool-calling is confirmed; do not extrapolate from that to MCP. No slice in this MVP needs MCP. |
 | `anthropic-beta` | Ignored | No beta features; do not depend on any. |
 | `tools`, `tool_choice` | Supported | The agent loop itself is sound. |
 
@@ -356,13 +367,13 @@ result contract in §5 is a plain struct with `encoding/json` tags.
 | Risk | Mitigation |
 |---|---|
 | Task prompt overruns the `workflow_dispatch` payload budget | **25 inputs max, and 65,535 characters across the *entire* serialized `inputs` object** — not per input ([REST docs](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event); raised from 10 in [Dec 2025](https://github.blog/changelog/2025-12-04-actions-workflow-dispatch-workflows-now-support-25-inputs/)). `task`, `slice_id`, and `base_ref` share one budget. The CLI measures the serialized aggregate and rejects oversized slices by name before dispatch, rather than surfacing GitHub's bare `Error: inputs are too large`. Payload indirection stays out of the MVP |
-| Consumer's caller omits `run-name`, so correlation silently dies | `swarm init` generates the caller correctly; `swarm run` preflights it and refuses to dispatch on a mismatch, so no orphan run is created (AC1). Both are local, read-only — no write access to consumer repos. Post-dispatch fail-fast is the backstop for the preflight/dispatch race |
+| Caller in the consumer's repo is wrong or uncommitted | No longer a correlation risk — the run ID comes from the dispatch response (AC1), so `run-name` is display-only. Residual: a caller whose declared inputs mismatch. `swarm init` generates it; `swarm run` preflights the **remote** ref and refuses to dispatch, so no orphan run is created |
 | Agent pushes garbage to the target repo | Agent job has no write token (D2); `publish` validates the patch (AC10); `swarm/*` namespace only; branch protection on `main` |
 | Prompt injection from repo content exfiltrates `DEEPSEEK_API_KEY` | **Not fully mitigable** — the key must reach the agent. Bounded by a dedicated, spend-capped, rotatable key and the trusted-input fence in §3. The write token is out of reach via the two-job split (AC9) |
 | Agent poisons the runner to hijack a later privileged step | Privileged work runs in a separate job on a fresh runner, consuming only a validated artifact (D2) |
 | Runaway job cost / infinite agent loop | Hard `timeout-minutes` on the job; `status: timeout` in the contract |
 | GitHub concurrency limit or Actions outage | AC7 queueing; swarm is additive — local execution always remains available |
-| No prompt caching on DeepSeek (D2) makes long loops superlinear in cost | Small slices; cap turns; record `usage` per slice and watch it |
+| Long agent loops cost more than expected | Measured once (AC8, a *trivial* 3-step task): 6 turns, 21,509 input + 1,141 output, 107,904 cached-read tokens — fixed system-prompt and tool-definition overhead dominates a small slice. Cross-slice behaviour is **unmeasured and not guaranteed**: caching is best-effort, needs a full prefix match, and expires when idle. Slices sharing one system prompt plausibly hit the shared prefix, but do not budget on it. Record `usage` per slice and measure against DeepSeek's own billing before treating cost as solved |
 | DeepSeek's Anthropic compatibility drifts or degrades | AC8 is a standing canary, not a one-off check; the runtime step is isolated so swapping to OpenCode or the real Anthropic API is a one-step change |
 | Unknown model name silently downgrades to `deepseek-v4-flash` | Workflow echoes the resolved model into `result.json` |
 
