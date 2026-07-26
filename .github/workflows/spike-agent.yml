@@ -26,12 +26,22 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Install Claude Code CLI
         run: |
           npm install -g @anthropic-ai/claude-code
           claude --version
+
+      # The nonce is generated HERE, at runtime, and is never sent in the
+      # prompt. The agent can only learn it by reading the file, and the
+      # expected sha256 therefore cannot be precomputed by anyone — including
+      # a model that memorised the previous fixture.
+      - name: Seed runtime nonce
+        run: |
+          NONCE="nonce-$(openssl rand -hex 16)"
+          echo "$NONCE" >> spike/target.txt
+          echo "seeded: $NONCE"
 
       - name: Run agent against DeepSeek
         env:
@@ -45,9 +55,29 @@ jobs:
         run: |
           set -o pipefail
           claude -p "$(cat spike/task.md)" \
-            --output-format json \
+            --output-format stream-json \
+            --verbose \
             --dangerously-skip-permissions \
-            | tee agent-output.json
+            | tee stream.jsonl
+
+      - name: Assert Bash was actually invoked
+        run: |
+          set -euo pipefail
+
+          echo "--- tool calls observed ---"
+          jq -r 'select(.type=="assistant")
+                 | .message.content[]?
+                 | select(.type=="tool_use")
+                 | .name' stream.jsonl | sort | uniq -c | tee tools.txt
+
+          # Observation, not inference: a Bash tool_use event must appear in
+          # the model's own output stream.
+          grep -qw 'Bash' tools.txt \
+            || { echo "FAIL: no Bash tool_use event — shell execution unproven"; exit 1; }
+          grep -qwE 'Read' tools.txt \
+            || { echo "FAIL: no Read tool_use event"; exit 1; }
+
+          echo "PASS: Bash and Read tool_use events observed"
 
       - name: Assert read + edit + shell all happened
         run: |
@@ -56,13 +86,9 @@ jobs:
           echo "--- target.txt ---"
           cat spike/target.txt
 
-          # (2) the edit
           grep -qx 'SPIKE-OK' spike/target.txt \
             || { echo "FAIL: no SPIKE-OK line — the agent did not edit the file"; exit 1; }
 
-          # (3) the shell command. The expected value is a sha256 prefix of the
-          # POST-EDIT file, so it cannot be guessed or reasoned out — only a real
-          # shell invocation, after a real edit, produces it.
           test -f spike/proof.txt \
             || { echo "FAIL: no proof.txt — the agent did not run the command"; exit 1; }
 
@@ -70,23 +96,27 @@ jobs:
           actual="$(tr -d '[:space:]' < spike/proof.txt)"
           echo "expected=$expected actual=$actual"
           [ "$expected" = "$actual" ] \
-            || { echo "FAIL: proof mismatch — shell output not genuine"; exit 1; }
+            || { echo "FAIL: proof mismatch — hash not genuine"; exit 1; }
 
-          echo "PASS: read + edit + shell verified"
+          echo "PASS: read + edit + shell verified against a runtime nonce"
 
       - name: Report diff and usage
         if: always()
         run: |
           {
+            echo '## Tools invoked'
+            echo '```'
+            cat tools.txt 2>/dev/null || echo 'none captured'
+            echo '```'
             echo '## Diff'
             echo '```'
             git --no-pager diff --stat || true
-            git --no-pager diff || true
             echo '```'
             echo '## Agent result'
             echo '```json'
-            jq '{num_turns, is_error, subtype, duration_ms, usage, total_cost_usd}' \
-              agent-output.json 2>/dev/null || echo 'no parseable output'
+            jq -c 'select(.type=="result")
+                   | {num_turns, is_error, subtype, duration_ms, usage, total_cost_usd}' \
+              stream.jsonl 2>/dev/null || echo 'no parseable result event'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -96,6 +126,7 @@ jobs:
         with:
           name: spike-output
           path: |
-            agent-output.json
+            stream.jsonl
+            tools.txt
             spike/
           if-no-files-found: warn

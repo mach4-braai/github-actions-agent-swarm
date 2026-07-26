@@ -1,6 +1,7 @@
 Do exactly these three things, in order, then stop.
 
-1. Read the file `spike/target.txt`.
+1. Read the file `spike/target.txt`. It contains a random nonce line that you
+   cannot know without reading it.
 2. Append exactly one new line to `spike/target.txt` containing only: SPIKE-OK
 3. Run this shell command:
 
