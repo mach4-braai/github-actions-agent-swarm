@@ -15,9 +15,25 @@ work there, and get a reviewable result back without babysitting the browser.
 
 ## 2. Goal
 
-A local CLI that takes N independent task slices, dispatches each to a GitHub
-Actions job running an ephemeral coding agent, and collects each slice's output
-as a reviewable artifact — while the local session stays free.
+A local CLI that takes N independent task slices and runs them **concurrently**
+as ephemeral coding agents on GitHub Actions, collecting each slice's output as
+a reviewable artifact — while the local session stays free.
+
+**Parallelism is the point, not a side effect.** A swarm that dispatches N
+slices and executes them one after another has no reason to exist: the local
+machine could do that. The wall-clock for N slices must approach the time of the
+slowest single slice, not the sum. Everything below that would serialise
+execution is therefore a defect, not a tuning issue.
+
+Ceilings, measured rather than assumed:
+
+| Limit | Value | Binding? |
+|---|---|---|
+| GitHub Actions concurrent jobs | **20** (this account is a Free org) | **Yes — this is the fan-out ceiling** |
+| DeepSeek concurrent requests | 500 (`deepseek-v4-pro`), 2500 (flash), [account-level](https://api-docs.deepseek.com/quick_start/rate_limit) | No, by a wide margin |
+
+A slice occupies one job at a time (`agent`, then `publish`), so roughly 20
+slices can be in flight. Beyond that GitHub queues them (AC7).
 
 Observable end state:
 
@@ -95,6 +111,16 @@ Each is verifiable. The MVP is done when all pass.
 - [ ] **AC7 — Concurrency is bounded and degrades sanely.** Dispatching more
       slices than the account's concurrency limit queues rather than fails, and
       `swarm status` shows queued slices distinctly from running ones.
+- [ ] **AC11 — Slices genuinely run at the same time.** Not "N runs exist" —
+      **overlapping execution**. Dispatch 5 slices, each sleeping long enough to
+      be observable, and assert from the runs' `run_started_at`/`updated_at`
+      that at least 4 were in `in_progress` simultaneously. Also assert
+      wall-clock for 5 slices is closer to one slice than to five.
+      Two ways this silently fails, both checked:
+      (a) the CLI dispatching in a serial loop — fan-out MUST be concurrent,
+      bounded by the ceiling in §2;
+      (b) the caller declaring a static `concurrency` group, which queues or
+      cancels sibling slices (see D1).
 - [x] **AC8 — DeepSeek sustains a multi-turn agentic loop.** *Met by run
       [30203984480](https://github.com/mach4-braai/github-actions-agent-swarm/actions/runs/30203984480).*
       Shell execution is **observed, not inferred**. The workflow seeded a
@@ -219,6 +245,9 @@ on:
       task:     { required: true,  type: string }
       base_ref: { required: false, type: string }
 
+# NO `concurrency:` KEY. See below — a static group serialises the swarm,
+# and with cancel-in-progress it makes slices kill each other.
+
 jobs:
   agent:
     uses: mach4-braai/github-actions-agent-swarm/.github/workflows/agent.yml@<sha>
@@ -251,16 +280,36 @@ Two supports remain, both still worth their keep:
   token that can push to a consumer's repo.
 - **`swarm run` preflights the *remote* caller before dispatching**, via
   `gh api repos/{owner}/{repo}/contents/.github/workflows/<file>?ref=<ref>`. It
-  no longer checks `run-name`; it verifies the **declared inputs** match what
-  the CLI is about to send. A dispatch naming an undeclared input is rejected by
-  GitHub anyway — preflight turns that into a clear local error instead of a
-  failed API call, and catches the uncommitted-caller case.
+  no longer checks `run-name`. It verifies two things:
+  1. the **declared inputs** match what the CLI is about to send — GitHub would
+     reject a mismatch anyway, but preflight turns that into a clear local
+     error and catches the uncommitted-caller case;
+  2. the caller declares **no serialising `concurrency` group** (below).
 
 Preflight must still read the **remote** ref, never the local working tree:
 dispatch executes whatever GitHub has, so a freshly `init`-ed but uncommitted
 file would pass a local check and then 404. `workflow_dispatch` also requires
 the workflow on the **default branch** for the event to exist at all, so
 preflight checks both the default branch and the dispatch ref when they differ.
+
+**A `concurrency` group in the caller destroys the swarm, quietly.** GitHub
+scopes concurrency by group name, so a static group makes every slice a member
+of the same queue:
+
+| Caller declares | Effect on N slices |
+|---|---|
+| no `concurrency` key | all N run in parallel — **correct** |
+| `concurrency: {group: swarm}` | slices run **one at a time**; the swarm becomes a slow loop |
+| `concurrency: {group: swarm, cancel-in-progress: true}` | each dispatch **cancels the previous slice**; almost all work is destroyed |
+
+The third is the dangerous one: it looks like a tidy CI hygiene habit, it is
+widely copy-pasted, and it fails by silently throwing away results rather than
+by erroring. Preflight therefore rejects any `concurrency.group` that does not
+vary with `slice_id`. A per-slice group (`group: swarm-${{ inputs.slice_id }}`)
+is harmless and allowed, since each slice is then its own group of one.
+
+The reusable workflow itself declares no `concurrency` key either, for the same
+reason — one there would serialise every consumer's slices globally.
 
 Secrets are mapped explicitly, never `secrets: inherit` — inherit hands the
 agent every secret the target repo owns, including ones unrelated to this
@@ -380,7 +429,9 @@ result contract in §5 is a plain struct with `encoding/json` tags.
 | Prompt injection from repo content exfiltrates `DEEPSEEK_API_KEY` | **Not fully mitigable** — the key must reach the agent. Bounded by a dedicated, spend-capped, rotatable key and the trusted-input fence in §3. The write token is out of reach via the two-job split (AC9) |
 | Agent poisons the runner to hijack a later privileged step | Privileged work runs in a separate job on a fresh runner, consuming only a validated artifact (D2) |
 | Runaway job cost / infinite agent loop | Hard `timeout-minutes` on the job; `status: timeout` in the contract |
-| GitHub concurrency limit or Actions outage | AC7 queueing; swarm is additive — local execution always remains available |
+| GitHub concurrency limit or Actions outage | Fan-out ceiling is **20 concurrent jobs** on this Free org — the binding constraint (§2). AC7 queueing; swarm is additive, local execution always remains available |
+| Swarm silently serialises and nobody notices | The failure looks like "it worked, just slowly", so it needs an assertion, not vigilance: AC11 requires **overlapping** run windows, not merely N runs. Preflight rejects serialising `concurrency` groups; the CLI fans out concurrently rather than looping |
+| A caller's `cancel-in-progress` makes slices kill each other | Worst case in the design — work is destroyed, not delayed, and it looks like tidy CI hygiene. Preflight rejects any `concurrency.group` that does not vary with `slice_id` (D1) |
 | Long agent loops cost more than expected | Measured once (AC8, a *trivial* 3-step task): 6 turns, 21,509 input + 1,141 output, 107,904 cached-read tokens — fixed system-prompt and tool-definition overhead dominates a small slice. Cross-slice behaviour is **unmeasured and not guaranteed**: caching is best-effort, needs a full prefix match, and expires when idle. Slices sharing one system prompt plausibly hit the shared prefix, but do not budget on it. Record `usage` per slice and measure against DeepSeek's own billing before treating cost as solved |
 | DeepSeek's Anthropic compatibility drifts or degrades | AC8 is a standing canary, not a one-off check; the runtime step is isolated so swapping to OpenCode or the real Anthropic API is a one-step change |
 | Unknown model name silently downgrades to `deepseek-v4-flash` | Workflow echoes the resolved model into `result.json` |
