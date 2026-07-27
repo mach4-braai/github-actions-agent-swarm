@@ -43,7 +43,7 @@ by GitHub rather than by the CLI:
 
 | Key | Bounds |
 |---|---|
-| `concurrency: {group: swarm, queue: max}` | one swarm run at a time per repo; further swarms queue FIFO instead of being cancelled |
+| `concurrency: {group: swarm, queue: max}` | one swarm run at a time per repo; further swarms queue instead of being cancelled. Order is **not guaranteed** — GitHub sorts by when a run started waiting, and start times vary. Nothing here depends on ordering |
 | `strategy.max-parallel: 5` | five slices at a time within the active swarm |
 
 Without the first, two overlapping swarms would run ten legs and the cap would
