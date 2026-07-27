@@ -33,10 +33,6 @@ jobs:
           npm install -g @anthropic-ai/claude-code
           claude --version
 
-      # The nonce is generated HERE, at runtime, and is never sent in the
-      # prompt. The agent can only learn it by reading the file, and the
-      # expected sha256 therefore cannot be precomputed by anyone — including
-      # a model that memorised the previous fixture.
       - name: Seed runtime nonce
         run: |
           NONCE="nonce-$(openssl rand -hex 16)"
@@ -70,8 +66,6 @@ jobs:
                  | select(.type=="tool_use")
                  | .name' stream.jsonl | sort | uniq -c | tee tools.txt
 
-          # Observation, not inference: a Bash tool_use event must appear in
-          # the model's own output stream.
           grep -qw 'Bash' tools.txt \
             || { echo "FAIL: no Bash tool_use event — shell execution unproven"; exit 1; }
           grep -qwE 'Read' tools.txt \
