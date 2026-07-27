@@ -29,11 +29,29 @@ Ceilings, measured rather than assumed:
 
 | Limit | Value | Binding? |
 |---|---|---|
-| GitHub Actions concurrent jobs | **20** (this account is a Free org) | **Yes — this is the fan-out ceiling** |
+| **Swarm fan-out cap** | **5 concurrent slices — hard, not configurable** | **Yes — the one that governs** |
+| GitHub Actions concurrent jobs | 20 (this account is a Free org) | No, while the cap is 5 |
 | DeepSeek concurrent requests | 500 (`deepseek-v4-pro`), 2500 (flash), [account-level](https://api-docs.deepseek.com/quick_start/rate_limit) | No, by a wide margin |
 
-A slice occupies one job at a time (`agent`, then `publish`), so roughly 20
-slices can be in flight. Beyond that GitHub queues them (AC7).
+A slice occupies one job at a time (`agent`, then `publish`). Five sits below
+GitHub's 20 so the swarm never consumes the whole account allowance: the target
+repo's ordinary CI keeps running, and a bad swarm burns a bounded amount before
+you notice.
+
+Two keys in the caller compose into a genuine repo-wide ceiling, both enforced
+by GitHub rather than by the CLI:
+
+| Key | Bounds |
+|---|---|
+| `concurrency: {group: swarm, queue: max}` | one swarm run at a time per repo; further swarms queue FIFO instead of being cancelled |
+| `strategy.max-parallel: 5` | five slices at a time within the active swarm |
+
+Without the first, two overlapping swarms would run ten legs and the cap would
+be per-run only. Enforcing that client-side would not hold — two shells or two
+machines can race — so it belongs on the server.
+
+Neither is a flag. Raising the cap means editing the caller workflow: a visible,
+reviewable change rather than a forgotten shell argument.
 
 Observable end state:
 
@@ -65,30 +83,23 @@ swarm collect         # branches + result.json per slice, locally
 
 Each is verifiable. The MVP is done when all pass.
 
-- [ ] **AC1 — Correlation.** `swarm run` obtains each slice's Actions run ID
-      **directly from the dispatch response**, not by polling and matching run
-      names. **The behaviour is gated on the API version, and this is a trap:**
+- [ ] **AC1 — Correlation.** `swarm run` dispatches **one** run (D5) and takes
+      its ID **directly from the dispatch response**, never by polling run
+      names. Per-slice state comes from
+      `GET /repos/{o}/{r}/actions/runs/{id}/jobs`, keyed by each matrix leg's
+      `slice_id`. The dispatch response is gated on the API version:
 
       | `X-GitHub-Api-Version` | Response |
       |---|---|
       | `2022-11-28` — **`gh`'s default** | `204 No Content`, no run ID |
       | `2026-03-10` | `200 OK` with `workflow_run_id`, `run_url`, `html_url` |
 
-      Both measured directly against this repo. `2022-11-28` is deprecated
-      (`Deprecation: 2026-03-10`, `Sunset: 2028-03-10`) but is still what a
-      plain `gh api` call selects, so **the CLI MUST send
-      `X-GitHub-Api-Version: 2026-03-10` explicitly.** Omitting it silently
-      regresses the whole design back to run-name correlation.
-
-      Verified: `POST …/dispatches` with the header returned
-      `{"workflow_run_id":30203984480,…}`; the same call without it returned
-      `204`. Remaining for S2: dispatch 3 slices, confirm 3 distinct
-      `workflow_run_id`s recorded in the manifest (§5a) before any polling.
-      `gh workflow run` does print the created run URL, but the CLI uses
-      `gh api` to read `workflow_run_id` as a structured field rather than
-      scraping a URL; URL parsing stays available as a compatibility fallback.
-      If a response ever lacks the ID, `swarm run` fails fast rather than
-      falling back to name matching.
+      Both measured against this repo. The CLI MUST send
+      `X-GitHub-Api-Version: 2026-03-10`; the default loses the run ID entirely.
+      Verified: with the header, `{"workflow_run_id":30203984480,…}`; without
+      it, `204`. Remaining for S2: one swarm of 3 slices yielding one
+      `workflow_run_id` and 3 job-level `slice_id`s in the manifest (§5a). A
+      response lacking the ID fails fast rather than guessing.
 - [ ] **AC2 — Isolation.** Each slice job checks out `base_ref` fresh; no slice
       observes another slice's commits. Verified: two slices editing the same
       file both succeed, each diffing against `base_ref`.
@@ -108,19 +119,29 @@ Each is verifiable. The MVP is done when all pass.
 - [ ] **AC6 — Secret hygiene.** Model API keys live only in repo secrets, are
       never echoed into logs or `result.json`, and the caller workflow exposes
       no fork-PR trigger path. Verified: log scan of a completed run.
-- [ ] **AC7 — Concurrency is bounded and degrades sanely.** Dispatching more
-      slices than the account's concurrency limit queues rather than fails, and
-      `swarm status` shows queued slices distinctly from running ones.
-- [ ] **AC11 — Slices genuinely run at the same time.** Not "N runs exist" —
-      **overlapping execution**. Dispatch 5 slices, each sleeping long enough to
-      be observable, and assert from the runs' `run_started_at`/`updated_at`
-      that at least 4 were in `in_progress` simultaneously. Also assert
-      wall-clock for 5 slices is closer to one slice than to five.
-      Two ways this silently fails, both checked:
-      (a) the CLI dispatching in a serial loop — fan-out MUST be concurrent,
-      bounded by the ceiling in §2;
-      (b) the caller declaring a static `concurrency` group, which queues or
-      cancels sibling slices (see D1).
+- [ ] **AC11 — Slices run concurrently, and never more than 5.** Not "N legs
+      exist" — **overlapping execution** plus a respected cap. Dispatch 8 slices
+      that each sleep long enough to observe, then from
+      `GET /repos/{o}/{r}/actions/runs/{id}/jobs` assert:
+      (a) at some instant **exactly 5** legs are `in_progress`, proving both real
+      parallelism and that `max-parallel: 5` binds;
+      (b) the other 3 are `queued`, never `cancelled` — this is what separates
+      `max-parallel` from a default `concurrency` group, which discards (D1);
+      (c) all 8 reach a terminal state **unattended**, with no CLI invocation
+      after `swarm run` exits;
+      (d) `swarm status` distinguishes queued from running;
+      (e) wall-clock is roughly two waves, not eight serial slices.
+- [ ] **AC12 — One failing slice does not harm its siblings.** Force one slice
+      to fail; every other slice still completes and publishes. Verified
+      adversarially, because GitHub's default `fail-fast: true` would cancel all
+      in-progress and queued legs, converting one bad task into total data loss.
+- [ ] **AC13 — The ceiling holds repo-wide, and CI is not starved.** Dispatch
+      two swarms back to back and assert the second **queues** rather than
+      running alongside — at no instant do more than 5 slice legs run in the
+      repo, and the first swarm is never cancelled. Then confirm an ordinary
+      workflow in the target repo still starts while a swarm is in flight. This
+      is what `concurrency: {group: swarm, queue: max}` buys beyond
+      `max-parallel` (§2); testing a single swarm would not catch its absence.
 - [x] **AC8 — DeepSeek sustains a multi-turn agentic loop.** *Met by run
       [30203984480](https://github.com/mach4-braai/github-actions-agent-swarm/actions/runs/30203984480).*
       Shell execution is **observed, not inferred**. The workflow seeded a
@@ -162,13 +183,17 @@ Each is verifiable. The MVP is done when all pass.
 cannot know `branch` or `commit` — they do not exist until `publish` applies
 the patch — so a single artifact written by `agent` could never carry them.
 
+**Artifact names are namespaced by `slice_id`.** Under D5 every slice is a
+matrix leg of *one* run, and `upload-artifact@v4` names must be unique within a
+run — generic names would collide across parallel legs.
+
 | Artifact | Written by | Contents |
 |---|---|---|
-| `agent-result.json` + `patch.diff` | `agent` job, `if: always()` | Everything the agent run knows: `status`, `summary`, `files_changed`, `usage`, `error`, timings, resolved model |
-| `result.json` | `publish` job, `if: always()` | **Authoritative.** `agent-result.json` plus `branch`, `commit`, and any publish-stage failure |
+| `agent-<slice_id>` (`agent-result.json` + `patch.diff`) | `agent` job, `if: always()` | Everything the agent run knows: `status`, `summary`, `files_changed`, `usage`, `error`, timings, resolved model |
+| `result-<slice_id>` (`result.json`) | `publish` job, `if: always()` | **Authoritative.** The above plus `branch`, `commit`, and any publish-stage failure |
 
-`result.json` is the record `swarm collect` reads. If `publish` never ran or
-failed, `collect` falls back to `agent-result.json` and reports the slice as
+`result-<slice_id>` is the record `swarm collect` reads. If `publish` never ran
+or failed, `collect` falls back to `agent-<slice_id>` and reports the slice as
 unpublished — the work is visible in `patch.diff` either way, never trapped.
 
 ```json
@@ -200,28 +225,26 @@ two orders of magnitude. Record tokens; price them outside the contract.
 
 ## 5a. Local run manifest
 
-`swarm run` exits, and each slice is its own Actions run — so a later
-`swarm status` has nothing to go on unless the dispatch is recorded locally.
-There is no daemon (§3), so the record is a file.
+`swarm run` exits, so a later `swarm status` has nothing to go on unless the
+dispatch is recorded locally. There is no daemon (§3), so the record is a file.
 
 ```
 ~/.swarm/<owner>/<repo>/
 ├── runs/<swarm_id>.json
-└── current            # swarm_id of the most recent run
+└── current
 ```
 
 `<swarm_id>.json` holds what the CLI cannot re-derive: `repo`, `base_ref`,
-`created_at`, and per slice its `slice_id`, task digest, and resolved Actions
-`run_id` once correlation (AC1) succeeds.
+`created_at`, the single parent `run_id` from the dispatch response, and the
+slice list (`slice_id` plus task digest). Per-slice state is not stored — it is
+read live from the run's jobs (AC1), so the manifest never goes stale.
 
 It lives under `$HOME`, not in the target repo: swarm state is the operator's,
 not the project's, and a `.swarm/` directory would otherwise need a
 `.gitignore` entry in every repo you ever swarm.
 
 `swarm status` and `swarm collect` default to `current` and accept
-`--run <swarm_id>` to address any earlier one. Concurrent swarms against the
-same repo are therefore unambiguous — each has its own manifest, and only the
-`current` pointer is shared.
+`--run <swarm_id>` to address a finished one.
 
 ## 6. Decisions
 
@@ -235,31 +258,47 @@ target repo adopts the swarm by committing a thin caller into its own
 `.github/workflows/`:
 
 ```yaml
-name: swarm-agent
-run-name: agent/${{ inputs.slice_id }}     # display only — nice logs, not load-bearing
+name: swarm
+run-name: swarm/${{ inputs.swarm_id }}
 
 on:
   workflow_dispatch:
     inputs:
-      slice_id: { required: true,  type: string }
-      task:     { required: true,  type: string }
+      swarm_id: { required: true,  type: string }
+      slices:   { required: true,  type: string }
       base_ref: { required: false, type: string }
 
-# NO `concurrency:` KEY. See below — a static group serialises the swarm,
-# and with cancel-in-progress it makes slices kill each other.
+concurrency:
+  group: swarm
+  queue: max
 
 jobs:
-  agent:
+  slices:
+    name: slice/${{ matrix.slice_id }}
+    strategy:
+      matrix:
+        include: ${{ fromJSON(inputs.slices) }}
+      max-parallel: 5
+      fail-fast: false
     uses: mach4-braai/github-actions-agent-swarm/.github/workflows/agent.yml@<sha>
     with:
-      slice_id: ${{ inputs.slice_id }}
-      task:     ${{ inputs.task }}
+      slice_id: ${{ matrix.slice_id }}
+      task:     ${{ matrix.task }}
       base_ref: ${{ inputs.base_ref }}
     permissions:
-      contents: write        # push swarm/* only
+      contents: write
     secrets:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 ```
+
+`slices` is a JSON array of `{slice_id, task}`. The two concurrency keys are
+explained in §2; `fail-fast: false` is mandatory (D5).
+
+The explicit `name:` is required, not cosmetic. GitHub's default label for a
+matrix leg interpolates every matrix value, so without it each job would be
+titled with the **entire task prompt** — unreadable in the UI, and a brittle
+correlation key. `slice_id` is constrained to `[a-z0-9-]{1,32}` so the job name
+stays a clean lookup handle.
 
 **`run-name` is display-only.** An earlier revision of this spec made it the
 correlation handle, on the premise that `workflow_dispatch` returns no run ID.
@@ -284,7 +323,8 @@ Two supports remain, both still worth their keep:
   1. the **declared inputs** match what the CLI is about to send — GitHub would
      reject a mismatch anyway, but preflight turns that into a clear local
      error and catches the uncommitted-caller case;
-  2. the caller declares **no serialising `concurrency` group** (below).
+  2. the concurrency keys are exactly as required (below) — the workflow-level
+     group present with `queue: max`, and no job-level group.
 
 Preflight must still read the **remote** ref, never the local working tree:
 dispatch executes whatever GitHub has, so a freshly `init`-ed but uncommitted
@@ -292,24 +332,23 @@ file would pass a local check and then 404. `workflow_dispatch` also requires
 the workflow on the **default branch** for the event to exist at all, so
 preflight checks both the default branch and the dispatch ref when they differ.
 
-**A `concurrency` group in the caller destroys the swarm, quietly.** GitHub
-scopes concurrency by group name, so a static group makes every slice a member
-of the same queue:
+**The two concurrency levels do opposite things, so preflight treats them
+differently.** Per the
+[workflow syntax reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency),
+a group permits one running run and — under the default `queue: single` — one
+pending, where "any existing `pending` job or workflow in the same concurrency
+group will be canceled." The default discards; `queue: max` queues up to 100.
 
-| Caller declares | Effect on N slices |
+| Placement | Verdict |
 |---|---|
-| no `concurrency` key | all N run in parallel — **correct** |
-| `concurrency: {group: swarm}` | slices run **one at a time**; the swarm becomes a slow loop |
-| `concurrency: {group: swarm, cancel-in-progress: true}` | each dispatch **cancels the previous slice**; almost all work is destroyed |
+| workflow-level `concurrency: {group: swarm, queue: max}` | **Required.** Serialises whole swarms without loss, giving the repo-wide half of the ceiling (§2) |
+| workflow-level with default `queue: single` | **Rejected.** Dispatching a second swarm cancels the first while it is pending |
+| any `cancel-in-progress: true` | **Rejected.** Kills a running swarm. Also invalid combined with `queue: max` |
+| `jobs.slices.concurrency` | **Rejected.** Gates the matrix legs, so slices serialise or cancel each other inside one swarm |
 
-The third is the dangerous one: it looks like a tidy CI hygiene habit, it is
-widely copy-pasted, and it fails by silently throwing away results rather than
-by erroring. Preflight therefore rejects any `concurrency.group` that does not
-vary with `slice_id`. A per-slice group (`group: swarm-${{ inputs.slice_id }}`)
-is harmless and allowed, since each slice is then its own group of one.
-
-The reusable workflow itself declares no `concurrency` key either, for the same
-reason — one there would serialise every consumer's slices globally.
+Groups are repository-scoped, so the blast radius is one consumer's own swarms.
+The reusable workflow declares no `concurrency` key — capping belongs in the
+caller, where the consumer can see it.
 
 Secrets are mapped explicitly, never `secrets: inherit` — inherit hands the
 agent every secret the target repo owns, including ones unrelated to this
@@ -419,19 +458,61 @@ Matches the incubator's stated preferred language and existing siblings
 `gh` is shelled out to rather than reimplemented against the REST API, and the
 result contract in §5 is a plain struct with `encoding/json` tags.
 
+### D5 — Fan-out: one caller run, matrix of slices, `max-parallel: 5` (DECIDED 2026-07-26)
+
+`swarm run` dispatches **one** workflow run whose single job is a matrix over
+the slices, each leg calling the reusable workflow. The caller template in D1 is
+the authoritative form; the load-bearing keys are `max-parallel: 5` and
+`fail-fast: false`.
+
+Supported explicitly: ["Jobs using the matrix strategy can call a reusable
+workflow."](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-a-matrix-strategy-with-a-reusable-workflow)
+Nesting allows ten levels; this uses two.
+
+**Why not a client-side cap.** The obvious alternative — the CLI dispatches five
+runs, then dispatches more as they finish — is broken by §3's no-daemon rule.
+`swarm run` exits, so nothing is left to drain the queue: slices six and beyond
+would stall until the operator happened to run another command. That
+contradicts the whole "local session stays free" premise. `max-parallel` hands
+the queue to Actions, which drains it unattended.
+
+It is also the *only* GitHub mechanism that queues without discarding. A
+`concurrency` group cancels pending runs by default (D1), and `queue: max`
+serialises to one at a time. `max-parallel: 5` runs five and queues the rest.
+
+**`fail-fast: false` is mandatory, and the default is wrong for us.** It
+[defaults to `true`](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategyfail-fast),
+which "will cancel all in-progress and queued jobs in the matrix if any job in
+the matrix fails." One slice hitting a syntax error would destroy every other
+slice's work. This is the same shape of trap as the `concurrency` key: a
+sensible default for ordinary CI, catastrophic for a swarm.
+
+**What this costs.** Slices are now jobs inside one run, not independent runs:
+
+- Correlation is *simpler*: one `workflow_run_id` from the dispatch response,
+  then per-slice status from `GET /repos/{o}/{r}/actions/runs/{id}/jobs`, keyed
+  by the matrix leg's `slice_id`.
+- Cancelling the parent run cancels every slice. Acceptable — that is usually
+  what you want, and it makes "stop the swarm" one call.
+- Re-running one slice is `gh run rerun --job <job_id>`, not a fresh dispatch.
+- All slices travel in one `slices` JSON input, so the **65,535-character
+  aggregate budget is now shared across every slice at once** — the payload
+  limit binds much sooner than it did with one dispatch per slice.
+- Matrix is capped at 256 jobs, far above the fan-out cap.
+
 ## 7. Risks & rollback
 
 | Risk | Mitigation |
 |---|---|
-| Task prompt overruns the `workflow_dispatch` payload budget | **25 inputs max, and 65,535 characters across the *entire* serialized `inputs` object** — not per input ([REST docs](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event); raised from 10 in [Dec 2025](https://github.blog/changelog/2025-12-04-actions-workflow-dispatch-workflows-now-support-25-inputs/)). `task`, `slice_id`, and `base_ref` share one budget. The CLI measures the serialized aggregate and rejects oversized slices by name before dispatch, rather than surfacing GitHub's bare `Error: inputs are too large`. Payload indirection stays out of the MVP |
+| Task prompts overrun the dispatch payload budget | **65,535 characters across the entire serialized `inputs` object**, and under D5 *every slice travels in one `slices` input* — so the budget is shared by the whole swarm at once, and binds far sooner than with one dispatch per slice ([REST docs](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event); the 25-property cap is not the constraint here). The CLI measures the serialized aggregate and names the offending slices before dispatch, rather than surfacing GitHub's bare `Error: inputs are too large`. Payload indirection stays out of the MVP |
 | Caller in the consumer's repo is wrong or uncommitted | No longer a correlation risk — the run ID comes from the dispatch response (AC1), so `run-name` is display-only. Residual: a caller whose declared inputs mismatch. `swarm init` generates it; `swarm run` preflights the **remote** ref and refuses to dispatch, so no orphan run is created |
 | Agent pushes garbage to the target repo | Agent job has no write token (D2); `publish` validates the patch (AC10); `swarm/*` namespace only; branch protection on `main` |
 | Prompt injection from repo content exfiltrates `DEEPSEEK_API_KEY` | **Not fully mitigable** — the key must reach the agent. Bounded by a dedicated, spend-capped, rotatable key and the trusted-input fence in §3. The write token is out of reach via the two-job split (AC9) |
 | Agent poisons the runner to hijack a later privileged step | Privileged work runs in a separate job on a fresh runner, consuming only a validated artifact (D2) |
 | Runaway job cost / infinite agent loop | Hard `timeout-minutes` on the job; `status: timeout` in the contract |
-| GitHub concurrency limit or Actions outage | Fan-out ceiling is **20 concurrent jobs** on this Free org — the binding constraint (§2). AC7 queueing; swarm is additive, local execution always remains available |
-| Swarm silently serialises and nobody notices | The failure looks like "it worked, just slowly", so it needs an assertion, not vigilance: AC11 requires **overlapping** run windows, not merely N runs. Preflight rejects serialising `concurrency` groups; the CLI fans out concurrently rather than looping |
-| A caller's `cancel-in-progress` makes slices kill each other | Worst case in the design — work is destroyed, not delayed, and it looks like tidy CI hygiene. Preflight rejects any `concurrency.group` that does not vary with `slice_id` (D1) |
+| GitHub concurrency limit or Actions outage | The swarm caps itself at 5 (§2), below the account's 20, so it queues via `max-parallel` rather than contending. Swarm is additive — local execution always remains available |
+| Swarm silently serialises and nobody notices | Presents as "it worked, just slowly", so it needs an assertion rather than vigilance: AC11 requires exactly 5 legs `in_progress` at once, and the rest `queued` not `cancelled` |
+| A `concurrency` key or `fail-fast: true` destroys slices | Both cancel rather than delay, and both look like ordinary CI hygiene. Preflight rejects any `concurrency` key at either level (D1); `fail-fast: false` is mandatory and asserted by AC12 |
 | Long agent loops cost more than expected | Measured once (AC8, a *trivial* 3-step task): 6 turns, 21,509 input + 1,141 output, 107,904 cached-read tokens — fixed system-prompt and tool-definition overhead dominates a small slice. Cross-slice behaviour is **unmeasured and not guaranteed**: caching is best-effort, needs a full prefix match, and expires when idle. Slices sharing one system prompt plausibly hit the shared prefix, but do not budget on it. Record `usage` per slice and measure against DeepSeek's own billing before treating cost as solved |
 | DeepSeek's Anthropic compatibility drifts or degrades | AC8 is a standing canary, not a one-off check; the runtime step is isolated so swapping to OpenCode or the real Anthropic API is a one-step change |
 | Unknown model name silently downgrades to `deepseek-v4-flash` | Workflow echoes the resolved model into `result.json` |
